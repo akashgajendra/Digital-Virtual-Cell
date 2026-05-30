@@ -1,14 +1,16 @@
 """
-Fetch and cache external data needed by Layers 3 and 4.
+Fetch and cache external data needed by Layers 2, 3, and 4.
 Run this once before training.
 
-    uv run python -m src.fetch_external
+    uv run python -m src.fetch_external           # ChEMBL + gene symbols + MSigDB
+    uv run python -m src.fetch_external --lincs   # also process LINCS (needs .gctx)
 
 Saves to datasets/:
-    chembl_targets.parquet   — InChIKey × 64 target binary matrix  (Layer 3 aux branch)
-    gene_symbols.csv         — ENSEMBL ID → HGNC symbol            (Layer 4 readability)
-
-MSigDB Hallmark is cached automatically by gseapy on first use — no manual step needed.
+    chembl_targets.parquet      — InChIKey × 64 target binary matrix  (Layer 3 aux branch)
+    gene_symbols.csv            — ENSEMBL ID → HGNC symbol            (Layer 4 readability)
+    lincs_smiles.csv            — LINCS compound_id → SMILES          (Layer 2 KNN)
+    lincs_landmark_genes.txt    — 978 NCBI gene IDs for landmark genes
+    lincs_profiles.parquet      — compound × 978 gene expression      (Layer 2 KNN)
 """
 
 import glob
@@ -23,6 +25,11 @@ from src.config import DATASETS_DIR, N_AUX_TARGET, OUTPUT_GENES
 
 CHEMBL_TARGETS_PATH = DATASETS_DIR / "chembl_targets.parquet"
 GENE_SYMBOLS_PATH   = DATASETS_DIR / "gene_symbols.csv"
+
+LINCS_DIR              = DATASETS_DIR / "lincs"
+LINCS_PROFILES_PATH    = DATASETS_DIR / "lincs_profiles.parquet"
+LINCS_SMILES_PATH      = DATASETS_DIR / "lincs_smiles.csv"
+LINCS_LANDMARK_PATH    = DATASETS_DIR / "lincs_landmark_genes.txt"
 
 _BATCH   = 50    # ChEMBL recommended batch size
 _SLEEP   = 0.3   # seconds between batches — polite rate limiting
@@ -258,14 +265,128 @@ def prefetch_msigdb():
 
 
 # ---------------------------------------------------------------------------
-# Entry point — run all three in sequence
+# 4. LINCS L1000  (Layer 2 cell state KNN feature)
+# ---------------------------------------------------------------------------
+
+def prepare_lincs_metadata(force: bool = False):
+    """
+    Step 1 of 2 — runs as soon as geneinfo, siginfo, compoundinfo are downloaded.
+    Reads the three small LINCS metadata files and saves:
+      datasets/lincs_landmark_genes.txt  — 978 NCBI gene IDs
+      datasets/lincs_smiles.csv          — compound_id, smiles, inchi_key
+    """
+    if LINCS_SMILES_PATH.exists() and LINCS_LANDMARK_PATH.exists() and not force:
+        print(f"LINCS metadata already prepared  (pass force=True to redo)")
+        return
+
+    geneinfo    = pd.read_csv(LINCS_DIR / "geneinfo_beta.txt",    sep="\t")
+    siginfo     = pd.read_csv(LINCS_DIR / "siginfo_beta.txt",     sep="\t", low_memory=False)
+    compoundinfo = pd.read_csv(LINCS_DIR / "compoundinfo_beta.txt", sep="\t")
+
+    # 978 landmark gene IDs (NCBI integers, stored as strings in .gctx)
+    landmark_ids = geneinfo[geneinfo["feature_space"] == "landmark"]["gene_id"].astype(str).tolist()
+    with open(LINCS_LANDMARK_PATH, "w") as f:
+        f.write("\n".join(landmark_ids))
+    print(f"Saved {len(landmark_ids)} landmark gene IDs → {LINCS_LANDMARK_PATH}")
+
+    # Best sig_id per compound: exemplar + QC pass compound treatments
+    trt = siginfo[
+        (siginfo["pert_type"]       == "trt_cp") &
+        (siginfo["is_exemplar_sig"] == 1) &
+        (siginfo["qc_pass"]         == 1)
+    ][["sig_id", "pert_id"]].copy()
+    print(f"Exemplar + QC-pass compound sigs: {len(trt)}")
+
+    # Join SMILES from compoundinfo
+    smiles = compoundinfo[["pert_id", "canonical_smiles", "inchi_key"]].dropna(subset=["canonical_smiles"])
+    smiles = smiles.rename(columns={"canonical_smiles": "smiles"})
+
+    # One row per compound: keep first exemplar sig + SMILES
+    trt = trt.merge(smiles, on="pert_id", how="inner").drop_duplicates("pert_id")
+    trt = trt[["pert_id", "smiles", "inchi_key"]].rename(columns={"pert_id": "compound_id"})
+
+    trt.to_csv(LINCS_SMILES_PATH, index=False)
+    print(f"Saved {len(trt)} compounds with SMILES → {LINCS_SMILES_PATH}")
+
+
+def convert_lincs_gctx(force: bool = False):
+    """
+    Step 2 of 2 — run after level5_beta_trt_cp_*.gctx finishes downloading.
+    Reads the .gctx file, extracts the 978 landmark gene profiles for each
+    compound, averages across exemplar signatures, and saves:
+      datasets/lincs_profiles.parquet  — (n_compounds, 978) expression matrix
+    Requires: uv add cmapPy
+    """
+    if LINCS_PROFILES_PATH.exists() and not force:
+        print(f"LINCS profiles already converted  (pass force=True to redo)")
+        return
+
+    if not LINCS_SMILES_PATH.exists() or not LINCS_LANDMARK_PATH.exists():
+        raise RuntimeError("Run prepare_lincs_metadata() first.")
+
+    gctx_files = list(LINCS_DIR.glob("level5_beta_trt_cp_*.gctx"))
+    if not gctx_files:
+        raise FileNotFoundError(
+            f"No level5_beta_trt_cp_*.gctx found in {LINCS_DIR}/\n"
+            "Download it from https://clue.io/data/CMap2020#LINCS2020"
+        )
+    gctx_path = gctx_files[0]
+    print(f"Reading .gctx from {gctx_path} ...")
+
+    try:
+        from cmapPy.pandasGEXpress.parse import parse
+    except ImportError:
+        raise ImportError("Run: uv add cmapPy")
+
+    # Load pre-processed metadata
+    smiles_df    = pd.read_csv(LINCS_SMILES_PATH)
+    compound_ids = smiles_df["compound_id"].tolist()
+
+    with open(LINCS_LANDMARK_PATH) as f:
+        landmark_gene_ids = [l.strip() for l in f if l.strip()]
+
+    # Re-read siginfo to get all exemplar sig_ids for our compounds
+    siginfo = pd.read_csv(LINCS_DIR / "siginfo_beta.txt", sep="\t", low_memory=False)
+    target_sigs = siginfo[
+        (siginfo["pert_type"]       == "trt_cp") &
+        (siginfo["is_exemplar_sig"] == 1) &
+        (siginfo["qc_pass"]         == 1) &
+        (siginfo["pert_id"].isin(compound_ids))
+    ][["sig_id", "pert_id"]]
+    print(f"Extracting {len(target_sigs)} signatures for {target_sigs['pert_id'].nunique()} compounds ...")
+
+    # Read only landmark genes × target sigs from .gctx (much smaller than full matrix)
+    ds = parse(gctx_path, rid=landmark_gene_ids, cid=target_sigs["sig_id"].tolist())
+    # ds.data_df: (978 genes × n_sigs), columns = sig_ids, index = gene_ids
+
+    # Map sig_id → compound_id and average profiles per compound
+    sig_to_cmpd = target_sigs.set_index("sig_id")["pert_id"].to_dict()
+    expr = ds.data_df.T                                      # (n_sigs, 978)
+    expr.index = expr.index.map(sig_to_cmpd)                # rename rows to compound_id
+    expr.index.name = "compound_id"
+    profiles = expr.groupby("compound_id").mean()            # (n_compounds, 978)
+    profiles = profiles.astype(np.float32)
+
+    profiles.to_parquet(LINCS_PROFILES_PATH)
+    print(f"Saved LINCS profiles → {LINCS_PROFILES_PATH}  {profiles.shape}")
+
+
+def lincs_files_ready() -> bool:
+    """True if both LINCS output files exist and are ready to use."""
+    return LINCS_PROFILES_PATH.exists() and LINCS_SMILES_PATH.exists()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Fetch external data for Layers 3 and 4")
+    parser = argparse.ArgumentParser(description="Fetch external data for Layers 2, 3, and 4")
     parser.add_argument("--force", action="store_true", help="Re-fetch even if cache exists")
+    parser.add_argument("--lincs", action="store_true", help="Also process LINCS .gctx (needs level5 file)")
+    parser.add_argument("--lincs-meta-only", action="store_true", help="Prepare LINCS metadata without .gctx")
     args = parser.parse_args()
 
     print("=" * 50)
@@ -282,5 +403,17 @@ if __name__ == "__main__":
     print("3 / 3  MSigDB Hallmark")
     print("=" * 50)
     prefetch_msigdb()
+
+    if args.lincs_meta_only or args.lincs:
+        print("\n" + "=" * 50)
+        print("4 / 4  LINCS metadata (step 1/2)")
+        print("=" * 50)
+        prepare_lincs_metadata(force=args.force)
+
+    if args.lincs:
+        print("\n" + "=" * 50)
+        print("4 / 4  LINCS .gctx conversion (step 2/2)")
+        print("=" * 50)
+        convert_lincs_gctx(force=args.force)
 
     print("\nAll done. Run: uv run python model.py --train")

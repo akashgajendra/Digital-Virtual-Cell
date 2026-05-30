@@ -79,17 +79,25 @@ class CellStateEncoder:
         profiles = pd.read_parquet(profiles_path) if ext == ".parquet" else pd.read_csv(profiles_path)
         smi_df   = pd.read_csv(smiles_path)
 
-        gene_cols = [c for c in profiles.columns if c != "compound_id"]
-        self._lincs_profiles = profiles[gene_cols].values.astype(np.float32)
+        # Normalise: compound_id may be the index or a column
+        if "compound_id" not in profiles.columns:
+            profiles = profiles.reset_index().rename(columns={profiles.index.name or "index": "compound_id"})
+        if "compound_id" not in smi_df.columns:
+            smi_df = smi_df.reset_index().rename(columns={smi_df.index.name or "index": "compound_id"})
+
+        # Align profiles and smiles by compound_id so KNN rows always match
+        merged    = profiles.merge(smi_df[["compound_id", "smiles"]], on="compound_id", how="inner")
+        gene_cols = [c for c in merged.columns if c not in ("compound_id", "smiles")]
+        self._lincs_profiles = merged[gene_cols].values.astype(np.float32)
 
         fps = []
-        for smi in smi_df["smiles"]:
+        for smi in merged["smiles"]:
             mol = Chem.MolFromSmiles(str(smi)) if pd.notna(smi) else None
             fp  = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048) if mol else None
             fps.append(np.array(fp) if fp is not None else np.zeros(2048, dtype=np.float32))
         self._lincs_fingerprints = np.stack(fps).astype(np.float32)
         self._lincs_linear       = nn.Linear(5 * len(gene_cols), 64)
-        print(f"LINCS loaded: {len(profiles)} compounds, {len(gene_cols)} genes")
+        print(f"LINCS loaded: {len(merged)} compounds, {len(gene_cols)} genes")
 
     # ------------------------------------------------------------------
     # Encoding

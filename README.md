@@ -28,6 +28,41 @@ Place these files in the `datasets/` folder (they are gitignored):
 
 Files are discovered by glob, so the exact filename (e.g. `tvc-qnu-012`) doesn't matter.
 
+## External data (one-time setup)
+
+### ChEMBL targets, gene symbols, MSigDB
+
+Fetches from free APIs — no account needed:
+```bash
+uv run python -m src.fetch_external
+```
+
+### LINCS L1000 (Layer 2 KNN feature)
+
+**Step 1 — Download these 4 files** from [clue.io/data/CMap2020#LINCS2020](https://clue.io/data/CMap2020#LINCS2020) into `datasets/lincs/`:
+
+| File | Size |
+|---|---|
+| `level5_beta_trt_cp_n720216x12328.gctx` | ~10 GB |
+| `geneinfo_beta.txt` | small |
+| `siginfo_beta.txt` | small |
+| `compoundinfo_beta.txt` | small |
+
+**Step 2 — Process the metadata** (run as soon as the 3 small files are downloaded, before the big file finishes):
+```bash
+uv run python -m src.fetch_external --lincs-meta-only
+```
+Saves `datasets/lincs_smiles.csv` and `datasets/lincs_landmark_genes.txt`.
+
+**Step 3 — Convert the .gctx** (run after the big file finishes downloading):
+```bash
+uv add cmapPy
+uv run python -m src.fetch_external --lincs
+```
+Saves `datasets/lincs_profiles.parquet`. Training will pick it up automatically.
+
+> **Note:** `datasets/lincs/` is gitignored. Each teammate needs to download the files themselves.
+
 ## Running the model
 
 **Train:**

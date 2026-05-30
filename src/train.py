@@ -27,7 +27,7 @@ from src.data import (
     compute_nmf_factors,
     load_raw_data,
 )
-from src.fetch_external import load_chembl_targets
+from src.fetch_external import load_chembl_targets, lincs_files_ready, LINCS_PROFILES_PATH, LINCS_SMILES_PATH
 from src.placeholder import PlaceholderLayer1
 from src.fusion import FusionModel
 from src.loss import kl_variance_loss, wmse_loss
@@ -64,6 +64,10 @@ def train(epochs: int = EPOCHS, lr: float = LR) -> Path:
     print("\nFitting CellStateEncoder (Layer 2)...")
     cell_enc = CellStateEncoder()
     cell_enc.fit(counts, meta)
+    if lincs_files_ready():
+        cell_enc.load_lincs(str(LINCS_PROFILES_PATH), str(LINCS_SMILES_PATH))
+    else:
+        print("LINCS not loaded — run: uv run python -m src.fetch_external --lincs")
 
     # Align compound features with expression rows (both indexed by UUID)
     compounds_df = compounds_df.set_index("compound")
