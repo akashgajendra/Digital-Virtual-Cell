@@ -1,12 +1,9 @@
 """
-Neural network layers.
+Layer 3 — Fusion Model + Gene Program Bottleneck.
 
-PlaceholderLayer1  — temporary compound encoder until Layer 1 branch merges.
-FusionModel        — Layer 3: fusion + gene program bottleneck + uncertainty head.
-
-TEAMMATES: replace PlaceholderLayer1 with your real Layer 1 encoder.
-           Your encoder must accept (batch, 8) and output (batch, 1024).
-           The output dim must equal N_COMPOUND_EMB = 1024.
+Fuses compound_embedding (from Layer 1) + gated auxiliary targets (64)
++ cell_state (from Layer 2) → shared representation → gene program bottleneck
+→ predicted_expression (12,995 genes) + predicted_variance.
 """
 
 import numpy as np
@@ -14,7 +11,6 @@ import torch
 import torch.nn as nn
 
 from src.config import (
-    COMPOUND_FEATURE_COLS,
     DROPOUT,
     N_AUX_TARGET,
     N_CELL_STATE,
@@ -22,25 +18,6 @@ from src.config import (
     N_OUTPUT_GENES,
     N_PROGRAMS,
 )
-
-
-# ---------------------------------------------------------------------------
-# Layer 1 placeholder
-# ---------------------------------------------------------------------------
-
-class PlaceholderLayer1(nn.Module):
-    """Maps physicochemical features (8 dims) → 1024-dim compound_embedding."""
-
-    def __init__(self, input_dim: int = len(COMPOUND_FEATURE_COLS)):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 256), nn.LayerNorm(256), nn.GELU(), nn.Dropout(DROPOUT),
-            nn.Linear(256, 512),       nn.LayerNorm(512), nn.GELU(),
-            nn.Linear(512, N_COMPOUND_EMB), nn.LayerNorm(N_COMPOUND_EMB),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
 
 
 # ---------------------------------------------------------------------------

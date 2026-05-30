@@ -11,7 +11,7 @@ Usage:
 import argparse
 from pathlib import Path
 
-from src.layer4_interpret import interpret_programs, run_gsea_on_programs
+from src.interpret import interpret_programs, run_gsea_on_programs
 from src.predict import predict
 from src.runs import latest_run_dir
 from src.train import train

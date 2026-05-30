@@ -10,7 +10,8 @@ import vcpi_prediction_contest as vcpi
 
 from src.config import COMPOUND_FEATURE_COLS, N_AUX_TARGET, OUTPUT_GENES
 from src.data import load_raw_data
-from src.layer3_fusion import FusionModel, PlaceholderLayer1
+from src.placeholder import PlaceholderLayer1
+from src.fusion import FusionModel
 from src.runs import latest_run_dir
 
 

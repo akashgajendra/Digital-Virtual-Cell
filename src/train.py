@@ -9,7 +9,7 @@ import vcpi_prediction_contest as vcpi
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader
 
-from src.layer2_cell_state import CellStateEncoder
+from src.cell_state import CellStateEncoder
 from src.config import (
     BATCH_SIZE,
     COMPOUND_FEATURE_COLS,
@@ -27,7 +27,8 @@ from src.data import (
     compute_nmf_factors,
     load_raw_data,
 )
-from src.layer3_fusion import FusionModel, PlaceholderLayer1
+from src.placeholder import PlaceholderLayer1
+from src.fusion import FusionModel
 from src.loss import kl_variance_loss, wmse_loss
 from src.runs import make_run_dir
 
