@@ -935,7 +935,9 @@ def load_run_metadata(run_dir: Path) -> dict:
 
 def load_trained_model(run_dir: Path | None = None):
     """Load checkpoint, feature state, gene list, and metadata from run_dir."""
-
+    if run_dir is None:
+        run_dir = latest_run_dir()
+    checkpoint_path = run_dir / "model_checkpoint.pt"
     ckpt = torch.load(checkpoint_path, weights_only=True)
     model = PerturbationMLP(
         input_dim=ckpt["input_dim"],
