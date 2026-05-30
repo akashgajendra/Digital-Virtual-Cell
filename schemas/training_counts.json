@@ -1,0 +1,7 @@
+{
+  "name": "CountsSchema",
+  "description": "Counts parquet has gene_id as the row identifier and numeric columns for each sequenced cell.",
+  "gene_id": "",
+  "sequenced_cell_id": "",
+  "value_type": "string"
+}

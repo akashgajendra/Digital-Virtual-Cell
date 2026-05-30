@@ -1,0 +1,12 @@
+{
+  "name": "TestCompoundSchema",
+  "description": "Test compound inputs for prediction, including IDs, dose, cell line, and molecular structure.",
+  "compound": "",
+  "compound_name": "",
+  "compound_concentration": "",
+  "compound_concentration_unit": "",
+  "cell_line": "",
+  "timepoint": "",
+  "smiles": "",
+  "inchi_key": ""
+}

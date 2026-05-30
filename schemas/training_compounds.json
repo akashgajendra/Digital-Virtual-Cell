@@ -1,0 +1,17 @@
+{
+  "name": "CompoundsSchema",
+  "description": "Compound feature columns with identifiers, molecular descriptors, and counts.",
+  "compound": "",
+  "user_compound_id": "",
+  "smiles": "",
+  "purity_pct": "",
+  "molecular_weight": "",
+  "log_p": "",
+  "tpsa": "",
+  "inchi_key": "",
+  "num_rotatable_bonds": "",
+  "num_h_acceptors": "",
+  "num_h_donors": "",
+  "num_atoms": "",
+  "num_bonds": ""
+}
