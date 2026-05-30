@@ -36,8 +36,14 @@ from sklearn.model_selection import train_test_split
 
 DATASETS_DIR = Path("datasets")
 
-# Feature construction mode. Options: "fingerprints", "combined", "full".
-FEATURE_MODE = "fingerprints"
+# Feature construction mode. The proposed full encoder is the default:
+# Morgan(2048) + ChemBERTa(384) + UniMol(512) + physicochemical(9) = 2953.
+FEATURE_MODE = "full"
+MORGAN_DIM = 2048
+CHEMBERTA_DIM = 384
+UNIMOL_DIM = 512
+COMPOUND_EMBED_DIM = 1024
+TARGET_BRANCH_DIM = 64
 
 # Prediction target. Options:
 #   "log2cpm": absolute pseudo-bulk expression, log2(CPM+1)
@@ -57,13 +63,14 @@ COMPOUND_FEATURE_COLS = [
     "num_bonds",
     "purity_pct",
 ]
+MOLECULAR_INPUT_DIM = MORGAN_DIM + CHEMBERTA_DIM + UNIMOL_DIM + len(COMPOUND_FEATURE_COLS)
 
 N_TOP_GENES = 2000       # number of highly variable genes to model
 BATCH_SIZE = 64
 EPOCHS = 50
 LR = 1e-3
-HIDDEN_DIMS = [256, 512, 512, 256]
-DROPOUT = 0.2
+HIDDEN_DIMS = [1024, 512, 512, 256]
+DROPOUT = 0.1
 VAL_SIZE = 0.2
 RANDOM_STATE = 42
 RUNS_DIR = Path("runs")
@@ -75,7 +82,7 @@ rdBase.DisableLog("rdApp.warning")
 # Compound feature builders
 # ---------------------------------------------------------------------------
 
-def smiles_to_morgan(smiles, radius=2, nbits=2048):
+def smiles_to_morgan(smiles, radius=2, nbits=MORGAN_DIM):
     """Convert a SMILES string to a Morgan fingerprint bit vector."""
     if pd.isna(smiles):
         return np.zeros(nbits, dtype=np.float32)
@@ -141,15 +148,19 @@ def smiles_to_chemberta(smiles):
 
 _physchem_mean = None
 _physchem_std = None
+_chembl_target_cols = []
+_unimol_cache = None
+_warned_missing_unimol = False
 
 
 def _set_feature_state(state: dict | None):
     """Restore feature normalization state when predicting in a new process."""
-    global _physchem_mean, _physchem_std
+    global _physchem_mean, _physchem_std, _chembl_target_cols
     if not state:
         return
     _physchem_mean = state.get("physchem_mean")
     _physchem_std = state.get("physchem_std")
+    _chembl_target_cols = state.get("chembl_target_cols", [])
 
 
 def _get_feature_state() -> dict:
@@ -158,71 +169,167 @@ def _get_feature_state() -> dict:
         "feature_mode": FEATURE_MODE,
         "physchem_mean": _physchem_mean,
         "physchem_std": _physchem_std,
+        "chembl_target_cols": _chembl_target_cols,
     }
 
 
-def build_features(df, fit=False):
-    """
-    Build compound feature matrix according to FEATURE_MODE.
+def _fixed_dim(vec, dim: int) -> np.ndarray:
+    """Trim or zero-pad an embedding to the configured dimension."""
+    out = np.zeros(dim, dtype=np.float32)
+    arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+    out[: min(dim, len(arr))] = arr[:dim]
+    return out
 
-    fingerprints: Morgan fingerprints only.
-    combined: Morgan fingerprints + normalized physicochemical descriptors.
-    full: Morgan fingerprints + descriptors + ChemBERTa embeddings.
-    """
+
+def _ensure_physchem(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill missing physicochemical descriptor columns from SMILES when needed."""
+    missing = [col for col in COMPOUND_FEATURE_COLS if col not in df.columns]
+    if not missing:
+        return df
+    if "smiles" not in df.columns:
+        raise ValueError(
+            "Missing physicochemical columns and no smiles column is available "
+            "to compute them."
+        )
+    computed = pd.DataFrame(df["smiles"].apply(smiles_to_physchem).tolist(), index=df.index)
+    df = df.copy()
+    for col in missing:
+        df[col] = computed[col]
+    return df
+
+
+def _normalized_physchem(df: pd.DataFrame, fit: bool) -> np.ndarray:
+    """Return normalized physicochemical descriptors."""
     global _physchem_mean, _physchem_std
 
-    if FEATURE_MODE not in ("fingerprints", "combined", "full"):
-        raise ValueError(
-            f"Unsupported FEATURE_MODE={FEATURE_MODE!r}. "
-            "Use 'fingerprints', 'combined', or 'full'."
+    df = _ensure_physchem(df)
+    physchem = (
+        df[COMPOUND_FEATURE_COLS]
+        .apply(pd.to_numeric, errors="coerce")
+        .fillna(0)
+        .values
+    )
+    if fit:
+        _physchem_mean = physchem.mean(axis=0)
+        _physchem_std = physchem.std(axis=0) + 1e-8
+    if _physchem_mean is None or _physchem_std is None:
+        raise RuntimeError(
+            "Physicochemical normalization stats are missing. "
+            "Call build_compound_inputs(..., fit=True) first."
         )
+    return ((physchem - _physchem_mean) / _physchem_std).astype(np.float32)
 
-    results = []
 
+def _load_unimol_cache() -> pd.DataFrame | None:
+    """
+    Load precomputed UniMol embeddings when present.
+
+    Expected file: datasets/unimol_embeddings.csv, keyed by one of
+    compound/user_compound_id/inchi_key/smiles, with 512 numeric embedding
+    columns such as unimol_0 ... unimol_511.
+    """
+    global _unimol_cache, _warned_missing_unimol
+    if _unimol_cache is not None:
+        return _unimol_cache
+
+    path = DATASETS_DIR / "unimol_embeddings.csv"
+    if not path.exists():
+        if not _warned_missing_unimol:
+            print(
+                "Warning: datasets/unimol_embeddings.csv not found; "
+                "using zero UniMol embeddings."
+            )
+            _warned_missing_unimol = True
+        return None
+
+    cache = pd.read_csv(path)
+    embed_cols = [col for col in cache.columns if col.startswith("unimol_")]
+    if len(embed_cols) < UNIMOL_DIM:
+        raise ValueError(
+            f"{path} must contain at least {UNIMOL_DIM} columns named unimol_*."
+        )
+    _unimol_cache = cache
+    return _unimol_cache
+
+
+def _unimol_embeddings(df: pd.DataFrame) -> np.ndarray:
+    """Return 512-dim UniMol embeddings, using zeros where unavailable."""
+    cache = _load_unimol_cache()
+    if cache is None:
+        return np.zeros((len(df), UNIMOL_DIM), dtype=np.float32)
+
+    embed_cols = [col for col in cache.columns if col.startswith("unimol_")][:UNIMOL_DIM]
+    key_cols = ["compound", "user_compound_id", "inchi_key", "smiles"]
+    for key in key_cols:
+        if key in df.columns and key in cache.columns:
+            lookup = cache.drop_duplicates(key).set_index(key)[embed_cols]
+            matched = lookup.reindex(df[key])
+            return matched.fillna(0).to_numpy(dtype=np.float32)
+    return np.zeros((len(df), UNIMOL_DIM), dtype=np.float32)
+
+
+def _chembl_target_columns(df: pd.DataFrame, fit: bool) -> list[str]:
+    """Detect optional ChEMBL target columns and persist the training schema."""
+    global _chembl_target_cols
+    candidates = [
+        col for col in df.columns
+        if col.startswith("chembl_target_") or col.startswith("chembl_")
+    ]
+    if fit:
+        _chembl_target_cols = sorted(candidates)
+    return _chembl_target_cols
+
+
+def _chembl_targets(df: pd.DataFrame, fit: bool) -> np.ndarray | None:
+    """Return optional ChEMBL target features or None when not available."""
+    cols = _chembl_target_columns(df, fit)
+    if not cols:
+        return None
+    target_df = df.reindex(columns=cols, fill_value=0)
+    return (
+        target_df
+        .apply(pd.to_numeric, errors="coerce")
+        .fillna(0)
+        .to_numpy(dtype=np.float32)
+    )
+
+
+def build_compound_inputs(df, fit=False) -> tuple[np.ndarray, np.ndarray | None]:
+    """
+    Build the proposed molecular input and optional ChEMBL target input.
+
+    Molecular order:
+    Morgan(2048), ChemBERTa(384), UniMol(512), physicochemical(9).
+    """
     if len(df) == 0:
         raise ValueError("No compounds available for feature construction.")
+    if "smiles" not in df.columns:
+        raise ValueError("Compound features require a smiles column.")
 
-    if FEATURE_MODE in ("combined", "full"):
-        missing = [col for col in COMPOUND_FEATURE_COLS if col not in df.columns]
-        if missing:
-            if "smiles" not in df.columns:
-                raise ValueError(
-                    "Missing physicochemical columns and no smiles column is available "
-                    "to compute them."
-                )
-            computed = pd.DataFrame(df["smiles"].apply(smiles_to_physchem).tolist(), index=df.index)
-            df = df.copy()
-            for col in missing:
-                df[col] = computed[col]
+    if FEATURE_MODE != "full":
+        raise ValueError("The proposed architecture requires FEATURE_MODE='full'.")
 
-    if FEATURE_MODE in ("fingerprints", "combined", "full"):
-        morgan = np.stack(df["smiles"].apply(smiles_to_morgan).values)
-        results.append(morgan)
+    morgan = np.stack(df["smiles"].apply(smiles_to_morgan).values)
 
-    if FEATURE_MODE in ("combined", "full"):
-        physchem = (
-            df[COMPOUND_FEATURE_COLS]
-            .apply(pd.to_numeric, errors="coerce")
-            .fillna(0)
-            .values
+    print(f"Computing ChemBERTa embeddings for {len(df)} compounds...")
+    chemberta = np.stack(
+        df["smiles"].apply(lambda smiles: _fixed_dim(smiles_to_chemberta(smiles), CHEMBERTA_DIM)).values
+    )
+
+    unimol = _unimol_embeddings(df)
+    physchem = _normalized_physchem(df, fit)
+    molecular = np.hstack([morgan, chemberta, unimol, physchem]).astype(np.float32)
+    if molecular.shape[1] != MOLECULAR_INPUT_DIM:
+        raise RuntimeError(
+            f"Expected molecular input dim {MOLECULAR_INPUT_DIM}, got {molecular.shape[1]}."
         )
-        if fit:
-            _physchem_mean = physchem.mean(axis=0)
-            _physchem_std = physchem.std(axis=0) + 1e-8
-        if _physchem_mean is None or _physchem_std is None:
-            raise RuntimeError(
-                "Physicochemical normalization stats are missing. "
-                "Call build_features(..., fit=True) first."
-            )
-        physchem = (physchem - _physchem_mean) / _physchem_std
-        results.append(physchem.astype(np.float32))
+    return molecular, _chembl_targets(df, fit)
 
-    if FEATURE_MODE == "full":
-        print(f"Computing ChemBERTa embeddings for {len(df)} compounds...")
-        chemberta = np.stack(df["smiles"].apply(smiles_to_chemberta).values)
-        results.append(chemberta.astype(np.float32))
 
-    return np.hstack(results).astype(np.float32)
+def build_features(df, fit=False):
+    """Backward-compatible wrapper returning only the molecular features."""
+    molecular, _ = build_compound_inputs(df, fit=fit)
+    return molecular
 
 
 def make_run_dir() -> Path:
@@ -358,15 +465,22 @@ def select_top_genes(target_df: pd.DataFrame, n: int = N_TOP_GENES) -> list[str]
 # ---------------------------------------------------------------------------
 
 class PerturbationDataset(Dataset):
-    def __init__(self, X: np.ndarray, y: np.ndarray):
+    def __init__(self, X: np.ndarray, chembl_targets: np.ndarray | None, y: np.ndarray):
         self.X = torch.tensor(X, dtype=torch.float32)
+        self.chembl_targets = (
+            torch.tensor(chembl_targets, dtype=torch.float32)
+            if chembl_targets is not None
+            else None
+        )
         self.y = torch.tensor(y, dtype=torch.float32)
 
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+        if self.chembl_targets is None:
+            return self.X[idx], self.y[idx]
+        return self.X[idx], self.chembl_targets[idx], self.y[idx]
 
 
 def evaluate_arrays(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
@@ -383,11 +497,16 @@ def evaluate_arrays(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     return {"rmse": rmse, "mae": mae, "pearson": pearson}
 
 
-def predict_array(model: nn.Module, X: np.ndarray) -> np.ndarray:
+def predict_array(model: nn.Module, X: np.ndarray, chembl_targets: np.ndarray | None = None) -> np.ndarray:
     """Run model inference for a feature matrix."""
     model.eval()
     with torch.no_grad():
-        return model(torch.tensor(X, dtype=torch.float32)).numpy()
+        target_tensor = (
+            torch.tensor(chembl_targets, dtype=torch.float32)
+            if chembl_targets is not None
+            else None
+        )
+        return model(torch.tensor(X, dtype=torch.float32), target_tensor).numpy()
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +530,59 @@ class ResidualBlock(nn.Module):
         return self.relu(x + self.net(x))
 
 
+class CompoundEncoder(nn.Module):
+    """
+    Proposed first-stage compound encoder.
+
+    Molecular vector:
+    Morgan(2048) + ChemBERTa(384) + UniMol(512) + physicochemical(9)
+    -> Linear(2953, 1024) + LayerNorm + GELU + Dropout(0.1).
+
+    Optional ChEMBL targets:
+    Linear(n_targets, 64), multiplied by a learned sigmoid confidence gate.
+    """
+
+    def __init__(
+        self,
+        molecular_dim: int = MOLECULAR_INPUT_DIM,
+        embed_dim: int = COMPOUND_EMBED_DIM,
+        chembl_target_dim: int = 0,
+        target_branch_dim: int = TARGET_BRANCH_DIM,
+        dropout: float = DROPOUT,
+    ):
+        super().__init__()
+        self.chembl_target_dim = chembl_target_dim
+        self.molecular_encoder = nn.Sequential(
+            nn.Linear(molecular_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        if chembl_target_dim > 0:
+            self.target_encoder = nn.Linear(chembl_target_dim, target_branch_dim)
+            self.confidence_gate = nn.Parameter(torch.tensor(0.0))
+            self.output_dim = embed_dim + target_branch_dim
+        else:
+            self.target_encoder = None
+            self.confidence_gate = None
+            self.output_dim = embed_dim
+
+    def forward(self, molecular_x, chembl_targets=None):
+        compound_embedding = self.molecular_encoder(molecular_x)
+        if self.target_encoder is None:
+            return compound_embedding
+        if chembl_targets is None:
+            chembl_targets = torch.zeros(
+                molecular_x.shape[0],
+                self.chembl_target_dim,
+                dtype=molecular_x.dtype,
+                device=molecular_x.device,
+            )
+        target_embedding = self.target_encoder(chembl_targets)
+        target_embedding = torch.sigmoid(self.confidence_gate) * target_embedding
+        return torch.cat([compound_embedding, target_embedding], dim=1)
+
+
 class PerturbationMLP(nn.Module):
     """
     Maps compound molecular features → predicted per-gene response target.
@@ -422,42 +594,45 @@ class PerturbationMLP(nn.Module):
 
     def __init__(
         self,
-        input_dim: int,
         output_dim: int,
+        input_dim: int = MOLECULAR_INPUT_DIM,
+        chembl_target_dim: int = 0,
         hidden_dims: list[int] = HIDDEN_DIMS,
         dropout: float = DROPOUT,
     ):
         super().__init__()
+        self.compound_encoder = CompoundEncoder(
+            molecular_dim=input_dim,
+            embed_dim=COMPOUND_EMBED_DIM,
+            chembl_target_dim=chembl_target_dim,
+            target_branch_dim=TARGET_BRANCH_DIM,
+            dropout=dropout,
+        )
         layers = []
 
-        # Input → first hidden
-        layers += [
-            nn.Linear(input_dim, hidden_dims[0]),
-            nn.BatchNorm1d(hidden_dims[0]),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        ]
+        prev_dim = self.compound_encoder.output_dim
 
         # Hidden → hidden (residual where dims match)
-        for i in range(len(hidden_dims) - 1):
-            d_in, d_out = hidden_dims[i], hidden_dims[i + 1]
-            if d_in == d_out:
-                layers.append(ResidualBlock(d_in, dropout))
+        for hidden_dim in hidden_dims:
+            if prev_dim == hidden_dim:
+                layers.append(ResidualBlock(prev_dim, dropout))
             else:
                 layers += [
-                    nn.Linear(d_in, d_out),
-                    nn.BatchNorm1d(d_out),
+                    nn.Linear(prev_dim, hidden_dim),
+                    nn.BatchNorm1d(hidden_dim),
                     nn.ReLU(),
                     nn.Dropout(dropout),
                 ]
+            prev_dim = hidden_dim
 
         # Final hidden → output (no activation — regression output)
         layers.append(nn.Linear(hidden_dims[-1], output_dim))
 
         self.net = nn.Sequential(*layers)
 
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, molecular_x, chembl_targets=None):
+        compound_embedding = self.compound_encoder(molecular_x, chembl_targets)
+        return self.net(compound_embedding)
 
 
 # ---------------------------------------------------------------------------
@@ -499,15 +674,22 @@ def train(
 
     train_chem = compounds_df.loc[train_compounds].copy()
     val_chem = compounds_df.loc[val_compounds].copy()
-    X_train = build_features(train_chem, fit=True)
+    train_chem["compound"] = train_chem.index.astype(str)
+    val_chem["compound"] = val_chem.index.astype(str)
+    X_train, T_train = build_compound_inputs(train_chem, fit=True)
     y_train = target_df.loc[train_compounds].values.astype(np.float32)
-    X_val = build_features(val_chem, fit=False)
+    X_val, T_val = build_compound_inputs(val_chem, fit=False)
     y_val = target_df.loc[val_compounds].values.astype(np.float32)
 
-    dataset = PerturbationDataset(X_train, y_train)
+    dataset = PerturbationDataset(X_train, T_train, y_train)
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-    model = PerturbationMLP(input_dim=X_train.shape[1], output_dim=y_train.shape[1])
+    chembl_target_dim = 0 if T_train is None else T_train.shape[1]
+    model = PerturbationMLP(
+        input_dim=X_train.shape[1],
+        chembl_target_dim=chembl_target_dim,
+        output_dim=y_train.shape[1],
+    )
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
 
@@ -518,9 +700,14 @@ def train(
     model.train()
     for epoch in range(1, epochs + 1):
         total_loss = 0.0
-        for xb, yb in loader:
+        for batch in loader:
+            if chembl_target_dim > 0:
+                xb, tb, yb = batch
+            else:
+                xb, yb = batch
+                tb = None
             optimizer.zero_grad()
-            loss = criterion(model(xb), yb)
+            loss = criterion(model(xb, tb), yb)
             loss.backward()
             optimizer.step()
             total_loss += loss.item() * len(xb)
@@ -528,7 +715,7 @@ def train(
         if epoch % 10 == 0 or epoch == 1:
             print(f"  Epoch {epoch:>3}/{epochs}  MSE={avg:.4f}")
 
-    val_pred = predict_array(model, X_val)
+    val_pred = predict_array(model, X_val, T_val)
     val_metrics = evaluate_arrays(y_val, val_pred)
     print(
         "Validation: "
@@ -544,7 +731,12 @@ def train(
     metadata_path = run_dir / "run_metadata.json"
 
     torch.save(
-        {"state_dict": model.state_dict(), "input_dim": X_train.shape[1], "output_dim": y_train.shape[1]},
+        {
+            "state_dict": model.state_dict(),
+            "input_dim": X_train.shape[1],
+            "chembl_target_dim": chembl_target_dim,
+            "output_dim": y_train.shape[1],
+        },
         checkpoint_path,
     )
     with open(feature_state_path, "wb") as f:
@@ -558,6 +750,8 @@ def train(
             {
                 "target_mode": target_mode,
                 "feature_mode": FEATURE_MODE,
+                "molecular_input_dim": int(X_train.shape[1]),
+                "chembl_target_dim": int(chembl_target_dim),
                 "n_top_genes": N_TOP_GENES,
                 "epochs": epochs,
                 "lr": lr,
@@ -598,7 +792,11 @@ def load_trained_model(run_dir: Path | None = None):
         raise FileNotFoundError(f"No checkpoint at {checkpoint_path}. Run with --train first.")
 
     ckpt = torch.load(checkpoint_path, weights_only=True)
-    model = PerturbationMLP(input_dim=ckpt["input_dim"], output_dim=ckpt["output_dim"])
+    model = PerturbationMLP(
+        input_dim=ckpt["input_dim"],
+        chembl_target_dim=ckpt.get("chembl_target_dim", 0),
+        output_dim=ckpt["output_dim"],
+    )
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
 
@@ -625,7 +823,9 @@ def prepare_test_features(test_df: pd.DataFrame, compounds_df: pd.DataFrame) -> 
     compounds_by_uuid.index = compounds_by_uuid.index.astype(str)
     uuid_matches = test_ids.isin(compounds_by_uuid.index)
     if uuid_matches.all():
-        return compounds_by_uuid.loc[test_ids].reset_index(drop=True)
+        matched_features = compounds_by_uuid.loc[test_ids].copy()
+        matched_features["compound"] = test_ids.values
+        return matched_features.reset_index(drop=True)
 
     if "user_compound_id" in compounds_df.columns:
         compounds_by_user_id = compounds_df.copy()
@@ -644,6 +844,7 @@ def prepare_test_features(test_df: pd.DataFrame, compounds_df: pd.DataFrame) -> 
             if matched_features["smiles"].isna().any() and "smiles" in test_df.columns:
                 test_smiles = pd.Series(test_df["smiles"].values, index=matched_features.index)
                 matched_features["smiles"] = matched_features["smiles"].combine_first(test_smiles)
+            matched_features["compound"] = test_ids.values
             return matched_features.reset_index(drop=True)
 
     if "smiles" not in test_df.columns:
@@ -656,6 +857,7 @@ def prepare_test_features(test_df: pd.DataFrame, compounds_df: pd.DataFrame) -> 
         "No test compound IDs matched the training compounds file. "
         "Using smiles from test_compounds.csv for feature generation."
     )
+    test_df["compound"] = test_ids.values
     return test_df.reset_index(drop=True)
 
 
@@ -678,9 +880,9 @@ def predict(test_compounds_path: str, run_dir: Path | None = None) -> pd.DataFra
     compounds_path = _discover_file("compounds-*.csv")
     compounds_df = pd.read_csv(compounds_path).set_index("compound")
     test_chem = prepare_test_features(test_df, compounds_df)
-    X = build_features(test_chem, fit=False)
+    X, T = build_compound_inputs(test_chem, fit=False)
 
-    preds = predict_array(model, X)
+    preds = predict_array(model, X, T)
 
     target_col = "predicted_lfc" if target_mode == "l2fc" else "predicted_log2cpm"
 

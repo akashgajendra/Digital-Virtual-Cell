@@ -1,10 +1,9 @@
 # Digital Virtual Cell — Drug-seq Perturbation Model
 
 Predicts per-gene perturbation responses for unseen compounds using pseudo-bulk
-aggregates from VCPI Drug-seq data and a residual MLP trained on compound
-physicochemical features. The default target is now absolute pseudo-bulk
-expression, `log2(CPM+1)`. The old DMSO-relative L2FC target is still available
-with `--target-mode l2fc`.
+aggregates from VCPI Drug-seq data and a molecular encoder trained from SMILES.
+The default target is now absolute pseudo-bulk expression, `log2(CPM+1)`. The
+old DMSO-relative L2FC target is still available with `--target-mode l2fc`.
 
 ## Setup
 
@@ -27,8 +26,29 @@ Place these files in the `datasets/` folder (they are gitignored):
 | `vcpi_*_counts.parquet` | Gene expression counts (genes × cells) |
 | `metadata-*.csv` | Per-cell metadata (compound, cell line, controls) |
 | `compounds-*.csv` | Compound physicochemical features + SMILES |
+| `unimol_embeddings.csv` | Optional precomputed UniMol embeddings (`unimol_0` ... `unimol_511`) |
 
 Files are discovered by glob, so the exact filename (e.g. `tvc-qnu-012`) doesn't matter.
+
+## Architecture
+
+The compound encoder builds the proposed 2953-dimensional molecular input:
+
+| Source | Dimensions |
+|---|---:|
+| Morgan fingerprint | 2048 |
+| ChemBERTa embedding | 384 |
+| UniMol embedding | 512 |
+| Physicochemical descriptors | 9 |
+
+That vector is projected with `Linear(2953 -> 1024)`, `LayerNorm`, `GELU`, and
+`Dropout(0.1)`. If ChEMBL target columns are present in `compounds-*.csv`, they
+are passed through a gated auxiliary branch: `Linear(n_targets -> 64)` multiplied
+by a learned sigmoid confidence gate and concatenated to the compound embedding.
+
+UniMol embeddings are loaded from `datasets/unimol_embeddings.csv` when present.
+If the file is absent, the UniMol slot is filled with zeros so the model remains
+runnable with the same input shape.
 
 ## Running the model
 
