@@ -27,6 +27,7 @@ from src.data import (
     compute_nmf_factors,
     load_raw_data,
 )
+from src.fetch_external import load_chembl_targets
 from src.placeholder import PlaceholderLayer1
 from src.fusion import FusionModel
 from src.loss import kl_variance_loss, wmse_loss
@@ -79,8 +80,18 @@ def train(epochs: int = EPOCHS, lr: float = LR) -> Path:
     print("Computing cell state vectors...")
     cell_states = cell_enc.encode_batch(smiles_list, batch_id=0).numpy()
 
+    # ChEMBL auxiliary targets — None if not yet fetched (aux branch stays zero)
+    chembl_df   = load_chembl_targets()
+    inchikeys   = compounds_df.loc[common, "inchi_key"].tolist() if "inchi_key" in compounds_df.columns else None
+    aux_targets = None
+    if chembl_df is not None and inchikeys is not None:
+        aux_targets = chembl_df.reindex(inchikeys).fillna(0).values.astype(np.float32)
+        print(f"ChEMBL targets loaded: {aux_targets.shape}")
+    else:
+        print("ChEMBL targets not found — aux branch will use zeros. Run: uv run python -m src.fetch_external")
+
     # Dataset + loaders
-    dataset = PerturbationDataset(feats, cell_states, expr_aligned, dmso_mean.values)
+    dataset = PerturbationDataset(feats, cell_states, expr_aligned, dmso_mean.values, aux_targets)
     loader  = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
     # Layer 1 (placeholder) + Layer 3 model

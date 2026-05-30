@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from src.config import OUTPUT_GENES
+from src.fetch_external import load_gene_symbols
 
 
 def interpret_programs(
@@ -22,13 +23,19 @@ def interpret_programs(
     """
     For each compound, identify the most-activated gene programs and the
     top-loaded genes in each.  Returns a DataFrame for inspection/reporting.
+    Shows HGNC symbols if gene_symbols.csv has been fetched; otherwise ENSEMBL IDs.
     """
+    symbols = load_gene_symbols()  # {} if not yet fetched
+
+    def _name(gene_id: str) -> str:
+        return symbols.get(gene_id, gene_id)
+
     records = []
     for i, acts in enumerate(activations):
         for prog_id in np.argsort(acts)[::-1][:top_programs]:
             loadings       = nmf_H[prog_id]
             top_gene_idx   = np.argsort(loadings)[::-1][:top_genes]
-            top_gene_names = [OUTPUT_GENES[j] for j in top_gene_idx]
+            top_gene_names = [_name(OUTPUT_GENES[j]) for j in top_gene_idx]
             records.append({
                 "compound_idx":     i,
                 "program_id":       int(prog_id),

@@ -13,7 +13,6 @@ from sklearn.decomposition import NMF
 from torch.utils.data import Dataset
 
 from src.config import (
-    COMPOUND_FEATURE_COLS,
     DATASETS_DIR,
     N_AUX_TARGET,
     N_PROGRAMS,
@@ -140,19 +139,24 @@ class PerturbationDataset(Dataset):
 
     def __init__(
         self,
-        compound_features: np.ndarray,   # (n, 8)   StandardScaler-normalised
-        cell_states:       np.ndarray,   # (n, 117)
-        expression:        np.ndarray,   # (n, 12995) training targets
-        dmso_baseline:     np.ndarray,   # (12995,)  broadcast during training
+        compound_features: np.ndarray,            # (n, 8)     StandardScaler-normalised
+        cell_states:       np.ndarray,            # (n, 117)
+        expression:        np.ndarray,            # (n, 12995) training targets
+        dmso_baseline:     np.ndarray,            # (12995,)   broadcast during training
+        aux_targets:       np.ndarray | None = None,  # (n, 64) ChEMBL targets; zeros if None
     ):
-        self.X_comp   = torch.tensor(compound_features, dtype=torch.float32)
-        self.X_cell   = torch.tensor(cell_states,       dtype=torch.float32)
-        self.y        = torch.tensor(expression,        dtype=torch.float32)
-        self.dmso     = torch.tensor(dmso_baseline,     dtype=torch.float32)
-        self.aux_zero = torch.zeros(len(compound_features), N_AUX_TARGET)
+        self.X_comp = torch.tensor(compound_features, dtype=torch.float32)
+        self.X_cell = torch.tensor(cell_states,       dtype=torch.float32)
+        self.y      = torch.tensor(expression,        dtype=torch.float32)
+        self.dmso   = torch.tensor(dmso_baseline,     dtype=torch.float32)
+        self.aux    = (
+            torch.tensor(aux_targets, dtype=torch.float32)
+            if aux_targets is not None
+            else torch.zeros(len(compound_features), N_AUX_TARGET)
+        )
 
     def __len__(self):
         return len(self.X_comp)
 
     def __getitem__(self, idx):
-        return self.X_comp[idx], self.aux_zero[idx], self.X_cell[idx], self.dmso, self.y[idx]
+        return self.X_comp[idx], self.aux[idx], self.X_cell[idx], self.dmso, self.y[idx]

@@ -10,6 +10,7 @@ import vcpi_prediction_contest as vcpi
 
 from src.config import COMPOUND_FEATURE_COLS, N_AUX_TARGET, OUTPUT_GENES
 from src.data import load_raw_data
+from src.fetch_external import load_chembl_targets
 from src.placeholder import PlaceholderLayer1
 from src.fusion import FusionModel
 from src.runs import latest_run_dir
@@ -67,10 +68,18 @@ def predict(run_dir: Path | None = None) -> pd.DataFrame:
     cell_states = cell_enc.encode_batch(smiles_list, batch_id=0)
     dmso_tensor = torch.tensor(dmso_mean)
 
+    # ChEMBL auxiliary targets — zeros if not yet fetched
+    chembl_df  = load_chembl_targets()
+    inchikeys  = test_df["inchi_key"].tolist() if "inchi_key" in test_df.columns else None
+    if chembl_df is not None and inchikeys is not None:
+        aux_np  = chembl_df.reindex(inchikeys).fillna(0).values.astype("float32")
+        aux_t   = torch.tensor(aux_np)
+    else:
+        aux_t   = torch.zeros(len(X), N_AUX_TARGET)
+
     with torch.no_grad():
         emb                        = layer1(torch.tensor(X))
-        aux_zeros                  = torch.zeros(len(X), N_AUX_TARGET)
-        pred_expr, pred_var, progs = model(emb, aux_zeros, cell_states, dmso_tensor)
+        pred_expr, pred_var, progs = model(emb, aux_t, cell_states, dmso_tensor)
 
     pred_np  = pred_expr.numpy()
     var_np   = pred_var.numpy()

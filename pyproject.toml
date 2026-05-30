@@ -5,6 +5,9 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "chembl-webresource-client>=0.10.9",
+    "gseapy>=1.2.1",
+    "mygene>=3.2.2",
     "numpy>=2.4.6",
     "pandas>=3.0.3",
     "pyarrow>=24.0.0",
