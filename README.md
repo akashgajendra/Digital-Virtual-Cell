@@ -1,8 +1,10 @@
 # Digital Virtual Cell — Drug-seq Perturbation Model
 
-Predicts per-gene log2 fold-change (L2FC) for unseen compounds using pseudo-bulk
+Predicts per-gene perturbation responses for unseen compounds using pseudo-bulk
 aggregates from VCPI Drug-seq data and a residual MLP trained on compound
-physicochemical features.
+physicochemical features. The default target is now absolute pseudo-bulk
+expression, `log2(CPM+1)`. The old DMSO-relative L2FC target is still available
+with `--target-mode l2fc`.
 
 ## Setup
 
@@ -37,15 +39,27 @@ uv run python model.py --train
 
 Creates a timestamped run folder, e.g. `runs/20260530_143022/`, containing:
 - `model_checkpoint.pt`
-- `feature_scaler.pkl`
+- `feature_state.pkl`
 - `top_genes.txt`
+- `validation_metrics.json`
+- `run_metadata.json`
+
+**Train with the old L2FC target:**
+```bash
+uv run python model.py --train --target-mode l2fc
+```
+
+**Create the official test CSV from the contest package:**
+```bash
+uv run python generate_predictions.py
+```
 
 **Predict:**
 ```bash
 uv run python model.py --predict datasets/test_compounds.csv
 ```
 
-Loads the latest run automatically and writes `runs/<timestamp>/predictions.parquet`.
+Loads the latest run automatically and writes `runs/<timestamp>/predictions.csv`.
 
 **Train + predict in one shot:**
 ```bash
@@ -57,13 +71,41 @@ uv run python model.py --train --predict datasets/test_compounds.csv
 uv run python model.py --predict datasets/test_compounds.csv --run-dir runs/20260530_143022
 ```
 
+## Comparing old vs new models
+
+`test_compounds.csv` has no ground-truth expression values, so predictions on
+that file alone cannot prove improvement. To compare models, train both versions
+with the same validation split and compare their saved validation metrics:
+
+```bash
+uv run python model.py --train --target-mode l2fc
+uv run python model.py --train --target-mode log2cpm
+uv run python model.py --compare-runs runs/OLD_L2FC_RUN runs/NEW_LOG2CPM_RUN
+```
+
+Improvement criteria:
+- `RMSE` decreases: average squared prediction error is lower.
+- `MAE` decreases: average absolute prediction error is lower.
+- `Pearson` increases: predicted and observed gene-response patterns align more
+  strongly.
+
+For `log2cpm` vs `l2fc`, the fairest primary criteria are validation `RMSE` and
+`MAE` on the held-out labeled compounds, plus Pearson for pattern agreement.
+Predictions on `test_compounds.csv` are useful for submission generation, but
+they do not contain observed values and therefore are not an improvement test.
+The comparison command prints the old value, new value, delta, percent change,
+and whether each criterion improved.
+
 ## Output format
 
-`predictions.parquet` has one row per `(compound, gene_id)` pair:
+`predictions.csv` has one row per `(compound, gene_id)` pair:
 
-| compound | gene_id | predicted_lfc |
+| compound | gene_id | prediction |
 |---|---|---|
 | `f1361a6b-...` | `ENSG00000290825` | `0.42` |
+
+New `log2cpm` runs write `prediction` and `predicted_log2cpm`; old `l2fc` runs
+write `prediction` and `predicted_lfc`.
 
 ## Project structure
 
