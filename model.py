@@ -899,6 +899,56 @@ def predict(test_compounds_path: str, run_dir: Path | None = None) -> pd.DataFra
     print(f"Wrote {out_path}  ({len(out):,} rows)")
     return out
 
+    
+def verify(run_dir: Path | None = None) -> pd.DataFrame:
+    """Verify model predictions against the held-out validation set."""
+    model, top_genes, run_dir, metadata = load_trained_model(run_dir)
+    target_mode = metadata.get("target_mode", "l2fc")
+    val_compounds = metadata.get("val_compounds")
+
+    if not val_compounds:
+        raise ValueError(
+            "No validation split found in run metadata. Train with --val-size to save a validation set."
+        )
+
+    counts, meta, compounds_df = load_raw_data()
+    target_df, _ = compute_pseudobulk_targets(counts, meta, target_mode=target_mode)
+    target_df = target_df.loc[val_compounds, top_genes]
+
+    compounds_df = compounds_df.set_index("compound")
+    val_features = compounds_df.loc[val_compounds].copy()
+    val_features["compound"] = val_features.index.astype(str)
+    X_val, T_val = build_compound_inputs(val_features, fit=False)
+
+    preds = predict_array(model, X_val, T_val)
+    pred_df = pd.DataFrame(preds, index=val_compounds, columns=top_genes)
+
+    records = []
+    for compound in val_compounds:
+        for gene in top_genes:
+            records.append(
+                (
+                    compound,
+                    gene,
+                    float(target_df.loc[compound, gene]),
+                    float(pred_df.loc[compound, gene]),
+                )
+            )
+
+    out = pd.DataFrame(records, columns=["compound", "gene_id", "actual", "predicted"])
+    out["error"] = out["predicted"] - out["actual"]
+    out["abs_error"] = out["error"].abs()
+
+    verification_path = run_dir / "verification.csv"
+    out.to_csv(verification_path, index=False)
+    metrics = evaluate_arrays(target_df.to_numpy(dtype=np.float32), preds)
+    print(f"Wrote verification file to {verification_path}")
+    print(
+        f"Verification metrics: RMSE={metrics['rmse']:.4f}, "
+        f"MAE={metrics['mae']:.4f}, Pearson={metrics['pearson']:.4f}"
+    )
+    return out
+
 
 def compare_runs(old_run_dir: Path, new_run_dir: Path) -> dict:
     """Compare validation metrics from two trained runs."""
@@ -1007,9 +1057,14 @@ if __name__ == "__main__":
         metavar=("OLD_RUN", "NEW_RUN"),
         help="Compare validation metrics from two run directories",
     )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Verify the saved model against the held-out validation split",
+    )
     args = parser.parse_args()
 
-    if not args.train and not args.predict and not args.compare_runs:
+    if not args.train and not args.predict and not args.compare_runs and not args.verify:
         parser.print_help()
 
     if args.compare_runs:
@@ -1022,3 +1077,5 @@ if __name__ == "__main__":
         run_dir = train(target_mode=args.target_mode, val_size=args.val_size)
     if args.predict:
         predict(args.predict, run_dir=run_dir)
+    if args.verify:
+        verify(run_dir=run_dir)
