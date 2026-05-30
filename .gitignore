@@ -201,6 +201,12 @@ cython_debug/
 
 datasets/
 runs/
+
+# model run artifacts (old-style, before runs/ folder)
+model_checkpoint.pt
+feature_scaler.pkl
+top_genes.txt
+predictions.parquet
 #   you could uncomment the following to ignore the entire vscode folder
 # .vscode/
 # Temporary file for partial code execution
