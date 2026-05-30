@@ -1,0 +1,5 @@
+{
+  "name": "TestGeneSchema",
+  "description": "Gene identifiers for prediction targets.",
+  "gene_id": ""
+}
