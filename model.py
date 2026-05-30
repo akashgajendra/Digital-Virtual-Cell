@@ -29,6 +29,12 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModel, AutoTokenizer
 import pickle
 from sklearn.model_selection import train_test_split
+from vcpi_prediction_contest import (
+    aggregate_leaderboards,
+    load_gene_filter,
+    load_weights_matrix,
+    score_compounds,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -365,23 +371,53 @@ def _discover_file(pattern: str) -> Path:
     return Path(matches[0])
 
 
+def _discover_files(pattern: str) -> list[Path]:
+    """Return all files matching a glob pattern under DATASETS_DIR."""
+    matches = sorted(glob.glob(str(DATASETS_DIR / pattern)))
+    if not matches:
+        raise FileNotFoundError(
+            f"No files matching '{pattern}' found in {DATASETS_DIR}. "
+            "Make sure your datasets folder contains the VCPI files."
+        )
+    return [Path(match) for match in matches]
+
+
 def load_raw_data():
-    """Load counts, metadata, and compound features from the datasets folder."""
-    counts_path = _discover_file("vcpi_*_counts.parquet")
-    meta_path = _discover_file("metadata-*.csv")
-    compounds_path = _discover_file("compounds-*.csv")
+    """Load and merge all counts, metadata, and compound files from datasets/."""
+    counts_paths = _discover_files("vcpi_*_counts.parquet")
+    meta_paths = _discover_files("metadata-*.csv")
+    compounds_paths = _discover_files("compounds-*.csv")
 
-    print(f"Loading counts from  : {counts_path}")
-    print(f"Loading metadata from: {meta_path}")
-    print(f"Loading compounds from: {compounds_path}")
+    print("Loading counts from:")
+    for path in counts_paths:
+        print(f"  {path}")
+    print("Loading metadata from:")
+    for path in meta_paths:
+        print(f"  {path}")
+    print("Loading compounds from:")
+    for path in compounds_paths:
+        print(f"  {path}")
 
-    counts = pd.read_parquet(counts_path)           # (n_genes, n_cells+1)
-    meta = pd.read_csv(meta_path)                   # (n_cells, 26)
-    compounds_df = pd.read_csv(compounds_path)      # (n_compounds, 13)
-
-    # counts has gene_id as the first column; make it the index
-    counts = counts.set_index("gene_id")            # (n_genes, n_cells)
+    counts_pieces = []
+    for path in counts_paths:
+        piece = pd.read_parquet(path).set_index("gene_id")
+        counts_pieces.append(piece)
+    counts = (
+        pd.concat(counts_pieces, axis=1, join="outer")
+        .fillna(0)
+        .astype("int32")
+    )
     counts.columns = counts.columns.astype(str)
+
+    meta = pd.concat(
+        [pd.read_csv(path) for path in meta_paths],
+        ignore_index=True,
+    )
+    compounds_df = (
+        pd.concat([pd.read_csv(path) for path in compounds_paths], ignore_index=True)
+        .drop_duplicates(subset=["compound"])
+        .reset_index(drop=True)
+    )
 
     print(f"Counts shape : {counts.shape}  (genes × cells)")
     print(f"Metadata rows: {len(meta)}")
@@ -395,9 +431,9 @@ def compute_pseudobulk_targets(
     target_mode: str = TARGET_MODE,
 ):
     """
-    Aggregate single-cell counts to pseudo-bulk per compound and normalize to
-    log2-CPM. Depending on target_mode, return either absolute expression
-    log2(CPM+1) or L2FC relative to the DMSO control mean.
+    Convert each replicate/sample to log2(CPM+1), then average per compound.
+    Depending on target_mode, return either absolute expression log2(CPM+1)
+    or L2FC relative to the DMSO control mean.
 
     Returns
     -------
@@ -419,15 +455,14 @@ def compute_pseudobulk_targets(
     ctrl_ids = meta.loc[ctrl_mask, "sequenced_id"].tolist()
     trt_meta = meta[~ctrl_mask].copy()
 
-    def _log2cpm(count_matrix: pd.DataFrame) -> pd.Series:
-        """Sum across cells → CPM → log2(CPM+1)."""
-        pseudobulk = count_matrix.sum(axis=1)          # sum over cells
-        total = pseudobulk.sum()
-        cpm = pseudobulk / total * 1e6
-        return np.log2(cpm + 1)
+    def _mean_log2cpm(count_matrix: pd.DataFrame) -> pd.Series:
+        """CPM-normalize each sample, log-transform, then average replicates."""
+        totals = count_matrix.sum(axis=0).replace(0, np.nan)
+        cpm = count_matrix.div(totals, axis=1) * 1e6
+        return np.log2(cpm + 1).mean(axis=1).fillna(0)
 
     # Control baseline
-    ctrl_log2cpm = _log2cpm(counts[ctrl_ids])
+    ctrl_log2cpm = _mean_log2cpm(counts[ctrl_ids])
 
     # Per-compound pseudo-bulk target
     rows = {}
@@ -435,7 +470,7 @@ def compute_pseudobulk_targets(
         cell_cols = [c for c in grp["sequenced_id"].tolist() if c in counts.columns]
         if not cell_cols:
             continue
-        cmp_log2cpm = _log2cpm(counts[cell_cols])
+        cmp_log2cpm = _mean_log2cpm(counts[cell_cols])
         if target_mode == "l2fc":
             rows[compound_id] = cmp_log2cpm - ctrl_log2cpm
         else:
@@ -458,6 +493,83 @@ def select_top_genes(target_df: pd.DataFrame, n: int = N_TOP_GENES) -> list[str]
     gene_var = target_df.var(axis=0)
     top = gene_var.nlargest(n).index.tolist()
     return top
+
+
+def contest_gene_filter(target_df: pd.DataFrame) -> list[str]:
+    """Return scored contest genes present in the target matrix."""
+    contest_genes = load_gene_filter()
+    genes = [gene for gene in contest_genes if gene in target_df.columns]
+    if not genes:
+        raise ValueError("None of the contest gene_filter genes are present in the counts matrix.")
+    missing = len(contest_genes) - len(genes)
+    if missing:
+        print(f"Warning: {missing} contest genes are missing from the counts matrix.")
+    return genes
+
+
+def prediction_frames(
+    compounds: list[str],
+    user_compound_ids: pd.Series,
+    genes: list[str],
+    truth_values: np.ndarray,
+    pred_values: np.ndarray,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build long truth/prediction frames expected by the contest scorer."""
+    compound_ids = user_compound_ids.loc[compounds].astype(str).tolist()
+    row_index = pd.MultiIndex.from_product(
+        [compound_ids, genes],
+        names=["compound", "gene_id"],
+    )
+    truth = pd.DataFrame(
+        {
+            "expression": truth_values.reshape(-1),
+        },
+        index=row_index,
+    ).reset_index()
+    pred = pd.DataFrame(
+        {
+            "predicted_expression": np.maximum(pred_values.reshape(-1), 0),
+        },
+        index=row_index,
+    ).reset_index()
+    return truth, pred
+
+
+def score_validation_predictions(
+    truth: pd.DataFrame,
+    pred: pd.DataFrame,
+    gene_filter: list[str],
+) -> tuple[dict, pd.DataFrame]:
+    """Score validation predictions with the contest wMSE metric."""
+    weights_source = "official"
+    try:
+        weights = load_weights_matrix()
+        per_compound = score_compounds(
+            truth,
+            pred,
+            gene_filter=gene_filter,
+            weights=weights,
+        )
+    except Exception as exc:
+        weights_source = "truth_derived"
+        print(
+            "Warning: official weights could not be loaded; "
+            f"using scorer-derived validation weights instead. Reason: {exc}"
+        )
+        per_compound = score_compounds(
+            truth,
+            pred,
+            gene_filter=gene_filter,
+        )
+
+    board = aggregate_leaderboards(per_compound)
+    metrics = {
+        "wmse_mean": float(board["wmse_mean"]),
+        "wmse_weights_source": weights_source,
+    }
+    if "wmse_std" in board:
+        metrics["wmse_std"] = float(board["wmse_std"])
+    return metrics, per_compound
 
 
 # ---------------------------------------------------------------------------
@@ -654,7 +766,7 @@ def train(
     print(f"\nComputing pseudo-bulk targets ({target_mode})...")
     target_df, _ = compute_pseudobulk_targets(counts, meta, target_mode=target_mode)
 
-    # Align compound features with lfc rows
+    # Align compound features with target rows
     compounds_df = compounds_df.set_index("compound")
     common = target_df.index.intersection(compounds_df.index)
     print(f"Compounds with both targets and features: {len(common)}")
@@ -668,9 +780,13 @@ def train(
         random_state=RANDOM_STATE,
     )
 
-    print("Selecting top HVGs from training compounds...")
-    top_genes = select_top_genes(target_df.loc[train_compounds], N_TOP_GENES)
-    target_df = target_df[top_genes]
+    if target_mode == "log2cpm":
+        print("Using contest gene_filter genes for training and validation...")
+        target_genes = contest_gene_filter(target_df)
+    else:
+        print("Selecting top HVGs from training compounds...")
+        target_genes = select_top_genes(target_df.loc[train_compounds], N_TOP_GENES)
+    target_df = target_df[target_genes]
 
     train_chem = compounds_df.loc[train_compounds].copy()
     val_chem = compounds_df.loc[val_compounds].copy()
@@ -717,12 +833,44 @@ def train(
 
     val_pred = predict_array(model, X_val, T_val)
     val_metrics = evaluate_arrays(y_val, val_pred)
+    if target_mode == "log2cpm":
+        if "user_compound_id" in compounds_df.columns:
+            user_compound_ids = compounds_df["user_compound_id"].astype("string")
+            user_compound_ids = user_compound_ids.where(
+                user_compound_ids.notna(),
+                pd.Series(compounds_df.index.astype(str), index=compounds_df.index),
+            ).astype(str)
+        else:
+            user_compound_ids = pd.Series(compounds_df.index.astype(str), index=compounds_df.index)
+        val_truth, val_prediction_frame = prediction_frames(
+            val_compounds,
+            user_compound_ids,
+            target_genes,
+            y_val,
+            val_pred,
+        )
+        wmse_metrics, per_compound = score_validation_predictions(
+            val_truth,
+            val_prediction_frame,
+            target_genes,
+        )
+        val_metrics.update(wmse_metrics)
+    else:
+        val_truth = None
+        val_prediction_frame = None
+        per_compound = None
     print(
         "Validation: "
         f"RMSE={val_metrics['rmse']:.4f}  "
         f"MAE={val_metrics['mae']:.4f}  "
         f"Pearson={val_metrics['pearson']:.4f}"
     )
+    if "wmse_mean" in val_metrics:
+        print(
+            "Contest validation: "
+            f"wMSE={val_metrics['wmse_mean']:.4f}  "
+            f"weights={val_metrics['wmse_weights_source']}"
+        )
 
     checkpoint_path = run_dir / "model_checkpoint.pt"
     feature_state_path = run_dir / "feature_state.pkl"
@@ -742,9 +890,13 @@ def train(
     with open(feature_state_path, "wb") as f:
         pickle.dump(_get_feature_state(), f)
     with open(gene_list_path, "w") as f:
-        f.write("\n".join(top_genes))
+        f.write("\n".join(target_genes))
     with open(metrics_path, "w") as f:
         json.dump(val_metrics, f, indent=2)
+    if val_truth is not None and val_prediction_frame is not None and per_compound is not None:
+        val_truth.to_csv(run_dir / "validation_truth.csv", index=False)
+        val_prediction_frame.to_csv(run_dir / "validation_predictions.csv", index=False)
+        per_compound.to_csv(run_dir / "validation_per_compound.csv", index=False)
     with open(metadata_path, "w") as f:
         json.dump(
             {
@@ -752,7 +904,8 @@ def train(
                 "feature_mode": FEATURE_MODE,
                 "molecular_input_dim": int(X_train.shape[1]),
                 "chembl_target_dim": int(chembl_target_dim),
-                "n_top_genes": N_TOP_GENES,
+                "n_target_genes": len(target_genes),
+                "target_gene_source": "gene_filter" if target_mode == "log2cpm" else "top_hvg",
                 "epochs": epochs,
                 "lr": lr,
                 "val_size": val_size,
@@ -893,6 +1046,8 @@ def predict(test_compounds_path: str, run_dir: Path | None = None) -> pd.DataFra
     ]
     out = pd.DataFrame(records, columns=["compound", "gene_id", "prediction"])
     out[target_col] = out["prediction"]
+    if target_mode == "log2cpm":
+        out["predicted_expression"] = np.maximum(out["prediction"], 0)
 
     out_path = run_dir / "predictions.csv"
     out.to_csv(out_path, index=False)
@@ -916,38 +1071,49 @@ def verify(run_dir: Path | None = None) -> pd.DataFrame:
     target_df = target_df.loc[val_compounds, top_genes]
 
     compounds_df = compounds_df.set_index("compound")
+    if "user_compound_id" in compounds_df.columns:
+        user_compound_ids = compounds_df["user_compound_id"].astype("string")
+        user_compound_ids = user_compound_ids.where(
+            user_compound_ids.notna(),
+            pd.Series(compounds_df.index.astype(str), index=compounds_df.index),
+        ).astype(str)
+    else:
+        user_compound_ids = pd.Series(compounds_df.index.astype(str), index=compounds_df.index)
+
     val_features = compounds_df.loc[val_compounds].copy()
     val_features["compound"] = val_features.index.astype(str)
     X_val, T_val = build_compound_inputs(val_features, fit=False)
 
     preds = predict_array(model, X_val, T_val)
-    pred_df = pd.DataFrame(preds, index=val_compounds, columns=top_genes)
+    truth, pred = prediction_frames(
+        val_compounds,
+        user_compound_ids,
+        top_genes,
+        target_df.to_numpy(dtype=np.float32),
+        preds,
+    )
 
-    records = []
-    for compound in val_compounds:
-        for gene in top_genes:
-            records.append(
-                (
-                    compound,
-                    gene,
-                    float(target_df.loc[compound, gene]),
-                    float(pred_df.loc[compound, gene]),
-                )
-            )
-
-    out = pd.DataFrame(records, columns=["compound", "gene_id", "actual", "predicted"])
-    out["error"] = out["predicted"] - out["actual"]
-    out["abs_error"] = out["error"].abs()
-
-    verification_path = run_dir / "verification.csv"
-    out.to_csv(verification_path, index=False)
+    truth.to_csv(run_dir / "validation_truth.csv", index=False)
+    pred.to_csv(run_dir / "validation_predictions.csv", index=False)
     metrics = evaluate_arrays(target_df.to_numpy(dtype=np.float32), preds)
-    print(f"Wrote verification file to {verification_path}")
+    if target_mode == "log2cpm":
+        wmse_metrics, per_compound = score_validation_predictions(truth, pred, top_genes)
+        metrics.update(wmse_metrics)
+        per_compound.to_csv(run_dir / "validation_per_compound.csv", index=False)
+    with open(run_dir / "validation_metrics.json", "w") as f:
+        json.dump(metrics, f, indent=2)
+
+    print(f"Wrote validation files to {run_dir}/")
     print(
         f"Verification metrics: RMSE={metrics['rmse']:.4f}, "
         f"MAE={metrics['mae']:.4f}, Pearson={metrics['pearson']:.4f}"
     )
-    return out
+    if "wmse_mean" in metrics:
+        print(
+            f"Contest validation: wMSE={metrics['wmse_mean']:.4f}, "
+            f"weights={metrics['wmse_weights_source']}"
+        )
+    return pred
 
 
 def compare_runs(old_run_dir: Path, new_run_dir: Path) -> dict:
@@ -975,12 +1141,12 @@ def compare_runs(old_run_dir: Path, new_run_dir: Path) -> dict:
         "metrics": {},
     }
 
-    for metric in ("rmse", "mae", "pearson"):
+    for metric in ("wmse_mean", "rmse", "mae", "pearson"):
         old_value = old_metrics.get(metric)
         new_value = new_metrics.get(metric)
         if old_value is None or new_value is None:
             continue
-        if metric in ("rmse", "mae"):
+        if metric in ("wmse_mean", "rmse", "mae"):
             delta = old_value - new_value
             improved = new_value < old_value
             percent = delta / old_value * 100 if old_value else float("nan")
@@ -1010,7 +1176,7 @@ def print_run_comparison(comparison: dict):
             "test_compounds.csv predictions."
         )
     print("\nCriteria:")
-    print("  RMSE/MAE improve when they decrease.")
+    print("  wMSE/RMSE/MAE improve when they decrease.")
     print("  Pearson improves when it increases.")
     print("\nValidation comparison:")
     for metric, values in comparison["metrics"].items():

@@ -62,6 +62,9 @@ Creates a timestamped run folder, e.g. `runs/20260530_143022/`, containing:
 - `feature_state.pkl`
 - `top_genes.txt`
 - `validation_metrics.json`
+- `validation_truth.csv`
+- `validation_predictions.csv`
+- `validation_per_compound.csv`
 - `run_metadata.json`
 
 **Train with the old L2FC target:**
@@ -94,8 +97,18 @@ uv run python model.py --predict datasets/test_compounds.csv --run-dir runs/2026
 ## Comparing old vs new models
 
 `test_compounds.csv` has no ground-truth expression values, so predictions on
-that file alone cannot prove improvement. To compare models, train both versions
-with the same validation split and compare their saved validation metrics:
+that file alone cannot prove improvement. Training automatically holds out a
+validation split, writes contest-shaped truth/prediction CSVs, and reports
+weighted MSE (`wMSE`) when `--target-mode log2cpm` is used.
+
+To re-run validation for a saved run:
+
+```bash
+uv run python model.py --verify --run-dir runs/20260530_143022
+```
+
+To compare models, train both versions with the same validation split and
+compare their saved validation metrics:
 
 ```bash
 uv run python model.py --train --target-mode l2fc
@@ -104,6 +117,7 @@ uv run python model.py --compare-runs runs/OLD_L2FC_RUN runs/NEW_LOG2CPM_RUN
 ```
 
 Improvement criteria:
+- `wMSE` decreases: contest weighted prediction error is lower.
 - `RMSE` decreases: average squared prediction error is lower.
 - `MAE` decreases: average absolute prediction error is lower.
 - `Pearson` increases: predicted and observed gene-response patterns align more
