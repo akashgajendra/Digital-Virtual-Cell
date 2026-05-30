@@ -97,6 +97,15 @@ uv run python model.py --predict
 ```
 
 Loads the latest run automatically and writes `runs/<timestamp>/predictions.csv`.
+
+**Create final submission files:**
+```bash
+uv run python make_submission.py --run-dir runs/<timestamp>
+```
+
+Writes both `runs/<timestamp>/submission.csv` and
+`runs/<timestamp>/submission.parquet` with the required columns:
+`compound`, `gene_id`, and `predicted_expression`.
 **Train + predict in one shot:**
 ```bash
 uv run python model.py --train --predict
