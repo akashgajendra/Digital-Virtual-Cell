@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import torch
@@ -68,3 +70,8 @@ submission = pd.DataFrame(records, columns=[
 
 submission.to_csv("predictions.csv", index=False)
 print("Saved predictions.csv")
+
+out_path = Path("datasets/test_compounds.csv")
+out_path.parent.mkdir(parents=True, exist_ok=True)
+tc.to_csv(out_path, index=False)
+print(f"Wrote {out_path}")
