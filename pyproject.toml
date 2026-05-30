@@ -10,4 +10,8 @@ dependencies = [
     "pyarrow>=24.0.0",
     "scikit-learn>=1.8.0",
     "torch>=2.12.0",
+    "vcpi-prediction-contest",
 ]
+
+[tool.uv.sources]
+vcpi-prediction-contest = { git = "https://github.com/virtualcell-vcpi/vcpi-prediction-contest-2026.git" }
